@@ -253,8 +253,9 @@ async def test_daily_confirm_budget_blocks_new_targets_and_resends(async_session
 
 @pytest.mark.asyncio
 async def test_per_address_daily_cap_counts_every_org(async_session):
-    """One account can own many orgs; the per-org caps must not add up
-    against one recipient."""
+    """One account can own several orgs; the per-org caps must not add up
+    against one recipient. But an org's first mail to an address always goes
+    through, so no org can lock an address for everyone else."""
     victim = "victim@example.com"
     other_org = uuid.uuid4()
     await _queued_confirm_mails(
@@ -262,27 +263,24 @@ async def test_per_address_daily_cap_counts_every_org(async_session):
     )
     await async_session.commit()
 
+    # First mail from a fresh org: allowed even though the address is "full".
     org_id = uuid.uuid4()
+    (issued,) = await sync_targets(async_session, org_id, [victim])
+    assert issued.target.address == victim
+    await _queued_confirm_mails(async_session, org_id, 1, to=victim)
+    await async_session.commit()
+
+    # A repeat (resend) from that org is refused; the text names no counts.
+    issued.target.token_sent_at = NOW - RESEND_COOLDOWN - timedelta(seconds=1)
+    await async_session.flush()
     with pytest.raises(ConfirmBudgetExceeded) as exc:
-        await sync_targets(async_session, org_id, [victim])
+        await reissue_token(async_session, issued.target)
     assert (exc.value.scope, exc.value.address) == ("address", victim)
-    assert victim in str(exc.value)
-    # Nothing was written for the rejected save.
-    assert await list_targets(async_session, org_id) == []
+    assert "received" not in str(exc.value) and "3" not in str(exc.value)
 
     # Another address in the same org is unaffected.
-    (issued,) = await sync_targets(async_session, org_id, ["fine@example.com"])
-    assert issued.target.address == "fine@example.com"
-    await async_session.commit()
-
-    # A resend to the capped address is refused too.
-    (stuck,) = await stop_targets(
-        async_session, org_id, [victim], reason="complaint", email_id=None
-    )
-    await async_session.commit()
-    with pytest.raises(ConfirmBudgetExceeded) as exc:
-        await reissue_token(async_session, stuck)
-    assert exc.value.scope == "address"
+    (fine,) = await sync_targets(async_session, org_id, ["fine@example.com"])
+    assert fine.target.address == "fine@example.com"
 
 
 @pytest.mark.asyncio

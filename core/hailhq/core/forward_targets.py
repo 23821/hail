@@ -66,9 +66,12 @@ RESEND_COOLDOWN = timedelta(minutes=10)
 # PATCH: count the pending rows whose confirm link is still live (rows are
 # never deleted, so an expired link must not block the org forever), and
 # count the confirm mails actually queued in the last day (resends included).
-# The per-org caps multiply with orgs (one account may own many), so one
-# recipient address is also capped across every org: nobody gets flooded
-# with confirm mails from a stack of throwaway orgs.
+# The per-org caps multiply with orgs (one account may own a few), so one
+# recipient address is also capped across every org. An org's FIRST mail to
+# an address always goes through — otherwise one org could mail an address
+# three times and lock every other org out of it for a day. The cross-org
+# cap bites on repeats (resends), so a flood costs one org per mail and the
+# website caps orgs per account.
 MAX_PENDING_TARGETS = 10
 MAX_CONFIRM_MAILS_PER_DAY = 20
 MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY = 3
@@ -85,18 +88,16 @@ class PendingLimitExceeded(Exception):
 
 class ConfirmBudgetExceeded(Exception):
     """The org queued MAX_CONFIRM_MAILS_PER_DAY confirm mails in the last day
-    (``scope == "org"``), or the recipient already got
-    MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY from any org (``scope == "address"``).
-    ``str(exc)`` is safe to show the caller."""
+    (``scope == "org"``), or a repeat mail to one recipient would pass
+    MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY counted over every org
+    (``scope == "address"``). ``str(exc)`` is safe to show the caller: it
+    never says what other orgs did."""
 
     def __init__(self, scope: str, *, address: str | None = None) -> None:
         self.scope = scope
         self.address = address
         if scope == "address":
-            msg = (
-                f"{address} already received {MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY} "
-                "confirm mails today; try again tomorrow"
-            )
+            msg = f"confirm mails to {address} are paused for today; try again tomorrow"
         else:
             msg = (
                 f"confirm-mail limit reached ({MAX_CONFIRM_MAILS_PER_DAY} per day); "
@@ -229,9 +230,14 @@ async def _confirm_mails_last_day(db: AsyncSession, organization_id: UUID) -> in
     return int((await db.execute(stmt)).scalar_one())
 
 
-async def _confirm_mails_to_address_last_day(db: AsyncSession, address: str) -> int:
-    """Confirm mails queued to one recipient in the last day, every org."""
+async def _confirm_mails_to_address_last_day(
+    db: AsyncSession, address: str, *, organization_id: UUID | None = None
+) -> int:
+    """Confirm mails queued to one recipient in the last day: every org, or
+    only ``organization_id`` when given."""
     stmt = _confirm_mails_last_day_stmt().where(Email.to_addresses.any(address))
+    if organization_id is not None:
+        stmt = stmt.where(Email.organization_id == organization_id)
     return int((await db.execute(stmt)).scalar_one())
 
 
@@ -239,18 +245,24 @@ async def check_confirm_budget(
     db: AsyncSession, organization_id: UUID, *, addresses: list[str]
 ) -> None:
     """Raise :class:`ConfirmBudgetExceeded` when queueing one confirm mail to
-    each of ``addresses`` would pass the org's daily cap, or any one address's
-    cross-org daily cap. The org cap runs under the org lock; the address cap
-    is best-effort across orgs (no cross-org lock), which is enough to stop a
-    flood."""
+    each of ``addresses`` would pass the org's daily cap, or when a repeat
+    mail to one address would pass that address's cross-org daily cap. The
+    org's first mail to an address today is never refused by the address
+    cap. The org cap runs under the org lock; the address cap is best-effort
+    across orgs (no cross-org lock), which is enough to stop a flood."""
     if not addresses:
         return
     sent = await _confirm_mails_last_day(db, organization_id)
     if sent + len(addresses) > MAX_CONFIRM_MAILS_PER_DAY:
         raise ConfirmBudgetExceeded("org")
     for address in addresses:
-        got = await _confirm_mails_to_address_last_day(db, address)
-        if got + 1 > MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY:
+        own = await _confirm_mails_to_address_last_day(
+            db, address, organization_id=organization_id
+        )
+        if own == 0:
+            continue
+        total = await _confirm_mails_to_address_last_day(db, address)
+        if total + 1 > MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY:
             raise ConfirmBudgetExceeded("address", address=address)
 
 
