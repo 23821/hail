@@ -62,7 +62,6 @@ from hailhq.core.dns_lookup import (
 )
 from hailhq.core.email_sender import from_address_for
 from hailhq.core.forward_targets import (
-    MAX_CONFIRM_MAILS_PER_DAY,
     MAX_PENDING_TARGETS,
     ConfirmBudgetExceeded,
     IssuedToken,
@@ -92,6 +91,7 @@ from hailhq.core.system_email import (
     enqueue_system_email,
     noreply_address,
     render_forward_confirm,
+    sending_identity,
 )
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -819,15 +819,17 @@ async def patch_email_domain(
             ) from exc
         except ConfirmBudgetExceeded as exc:
             raise HTTPException(
-                status_code=http_status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=(
-                    f"confirm-mail limit reached ({MAX_CONFIRM_MAILS_PER_DAY} per "
-                    "day); try again tomorrow"
-                ),
+                status_code=http_status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)
             ) from exc
     if issued:
+        # Send through the org's hail-mail row, not necessarily ``sd``: the
+        # console saves one list to every domain row, and a custom-domain row
+        # carries no org prefix, so the mail would name the wrong sender.
+        identity = await sending_identity(db, sd.organization_id) or sd
         sender = noreply_address(
-            sd.organization_id, sd.local_prefix_org, settings.hail_mail_base_domain
+            sd.organization_id,
+            identity.local_prefix_org,
+            settings.hail_mail_base_domain,
         )
         for item in issued:
             subject, text, html = render_forward_confirm(
@@ -838,7 +840,7 @@ async def patch_email_domain(
             await enqueue_system_email(
                 db,
                 organization_id=sd.organization_id,
-                email_domain_id=sd.id,
+                email_domain_id=identity.id,
                 from_address=sender,
                 to=item.target.address,
                 subject=subject,

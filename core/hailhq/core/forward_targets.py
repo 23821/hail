@@ -33,6 +33,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = [
+    "MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY",
     "MAX_CONFIRM_MAILS_PER_DAY",
     "MAX_PENDING_TARGETS",
     "RESEND_COOLDOWN",
@@ -65,8 +66,12 @@ RESEND_COOLDOWN = timedelta(minutes=10)
 # PATCH: count the pending rows whose confirm link is still live (rows are
 # never deleted, so an expired link must not block the org forever), and
 # count the confirm mails actually queued in the last day (resends included).
+# The per-org caps multiply with orgs (one account may own many), so one
+# recipient address is also capped across every org: nobody gets flooded
+# with confirm mails from a stack of throwaway orgs.
 MAX_PENDING_TARGETS = 10
 MAX_CONFIRM_MAILS_PER_DAY = 20
+MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY = 3
 CONFIRM_WINDOW = timedelta(hours=24)
 
 
@@ -79,7 +84,25 @@ class PendingLimitExceeded(Exception):
 
 
 class ConfirmBudgetExceeded(Exception):
-    """The org queued MAX_CONFIRM_MAILS_PER_DAY confirm mails in the last day."""
+    """The org queued MAX_CONFIRM_MAILS_PER_DAY confirm mails in the last day
+    (``scope == "org"``), or the recipient already got
+    MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY from any org (``scope == "address"``).
+    ``str(exc)`` is safe to show the caller."""
+
+    def __init__(self, scope: str, *, address: str | None = None) -> None:
+        self.scope = scope
+        self.address = address
+        if scope == "address":
+            msg = (
+                f"{address} already received {MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY} "
+                "confirm mails today; try again tomorrow"
+            )
+        else:
+            msg = (
+                f"confirm-mail limit reached ({MAX_CONFIRM_MAILS_PER_DAY} per day); "
+                "try again tomorrow"
+            )
+        super().__init__(msg)
 
 
 class ResendTooSoon(Exception):
@@ -189,28 +212,46 @@ async def _pending_count(db: AsyncSession, organization_id: UUID) -> int:
     return int((await db.execute(stmt)).scalar_one())
 
 
-async def _confirm_mails_last_day(db: AsyncSession, organization_id: UUID) -> int:
-    stmt = (
+def _confirm_mails_last_day_stmt():
+    return (
         select(func.count())
         .select_from(Email)
-        .where(Email.organization_id == organization_id)
         .where(Email.direction == "outbound")
         .where(Email.metadata_["system_kind"].astext == SYSTEM_KIND_FORWARD_CONFIRM)
         .where(Email.created_at >= _now() - CONFIRM_WINDOW)
     )
+
+
+async def _confirm_mails_last_day(db: AsyncSession, organization_id: UUID) -> int:
+    stmt = _confirm_mails_last_day_stmt().where(
+        Email.organization_id == organization_id
+    )
+    return int((await db.execute(stmt)).scalar_one())
+
+
+async def _confirm_mails_to_address_last_day(db: AsyncSession, address: str) -> int:
+    """Confirm mails queued to one recipient in the last day, every org."""
+    stmt = _confirm_mails_last_day_stmt().where(Email.to_addresses.any(address))
     return int((await db.execute(stmt)).scalar_one())
 
 
 async def check_confirm_budget(
-    db: AsyncSession, organization_id: UUID, *, wanted: int
+    db: AsyncSession, organization_id: UUID, *, addresses: list[str]
 ) -> None:
-    """Raise :class:`ConfirmBudgetExceeded` when sending ``wanted`` more
-    confirm mails today would pass the daily cap."""
-    if wanted <= 0:
+    """Raise :class:`ConfirmBudgetExceeded` when queueing one confirm mail to
+    each of ``addresses`` would pass the org's daily cap, or any one address's
+    cross-org daily cap. The org cap runs under the org lock; the address cap
+    is best-effort across orgs (no cross-org lock), which is enough to stop a
+    flood."""
+    if not addresses:
         return
     sent = await _confirm_mails_last_day(db, organization_id)
-    if sent + wanted > MAX_CONFIRM_MAILS_PER_DAY:
-        raise ConfirmBudgetExceeded(organization_id)
+    if sent + len(addresses) > MAX_CONFIRM_MAILS_PER_DAY:
+        raise ConfirmBudgetExceeded("org")
+    for address in addresses:
+        got = await _confirm_mails_to_address_last_day(db, address)
+        if got + 1 > MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY:
+            raise ConfirmBudgetExceeded("address", address=address)
 
 
 async def list_targets(
@@ -285,7 +326,7 @@ async def sync_targets(
             MAX_PENDING_TARGETS
         ):
             raise PendingLimitExceeded(organization_id)
-        await check_confirm_budget(db, organization_id, wanted=len(strangers))
+        await check_confirm_budget(db, organization_id, addresses=strangers)
     now = _now()
     issued: list[IssuedToken] = []
     for addr in new:
@@ -327,7 +368,7 @@ async def reissue_token(db: AsyncSession, target: EmailForwardTarget) -> str:
         elapsed = now - target.token_sent_at
         if elapsed < RESEND_COOLDOWN:
             raise ResendTooSoon(RESEND_COOLDOWN - elapsed)
-    await check_confirm_budget(db, target.organization_id, wanted=1)
+    await check_confirm_budget(db, target.organization_id, addresses=[target.address])
     raw = _issue(target, now)
     await db.flush()
     return raw

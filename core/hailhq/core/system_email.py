@@ -19,8 +19,9 @@ from uuid import UUID
 
 from hailhq.core.config import settings
 from hailhq.core.hail_mail import org_prefix_from_id
-from hailhq.core.models import Email
+from hailhq.core.models import Email, EmailDomain
 from hailhq.core.urls import join_url
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "noreply_address",
     "render_forward_confirm",
     "render_forward_stopped",
+    "sending_identity",
 ]
 
 # forward_targets imports this: it counts queued confirm mails by it for the
@@ -118,6 +120,22 @@ def render_forward_stopped(*, address: str) -> tuple[str, str, str]:
         "mailbox owner accept it.</p>" + where_html
     )
     return subject, text, html
+
+
+async def sending_identity(
+    db: AsyncSession, organization_id: UUID
+) -> EmailDomain | None:
+    """The row a system mail is sent through: the org's hail-mail address
+    when it has one, else its oldest custom domain. Every caller uses this so
+    a confirm mail names the same ``noreply+<org>@`` the forwards come from,
+    whichever domain row the tenant happened to save."""
+    stmt = (
+        select(EmailDomain)
+        .where(EmailDomain.organization_id == organization_id)
+        .order_by((EmailDomain.kind != "hail_mail"), EmailDomain.created_at.asc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
 
 
 async def enqueue_system_email(

@@ -306,7 +306,9 @@ async def test_same_list_saved_to_two_domain_rows_sends_one_confirm(
     await async_session.commit()
     await async_session.refresh(custom)
 
-    for did in (domain.id, custom.id):
+    # The custom row is saved first: its confirm mail must still go out
+    # through the org's hail-mail row so it names the real sender.
+    for did in (custom.id, domain.id):
         r = await client.patch(
             f"/email-domains/{did}",
             json={"inbound_enabled": True, "forward_to": ["stranger@other.com"]},
@@ -328,8 +330,9 @@ async def test_same_list_saved_to_two_domain_rows_sends_one_confirm(
     assert [(t.address, t.status) for t in rows] == [("stranger@other.com", "pending")]
     queued = await _queued_system(async_session, org_id)
     assert len(queued) == 1
-    # Custom rows have no org prefix; the sender falls back to the id-derived one.
+    # Custom rows have no org prefix; the mail is sent through the hail-mail row.
     assert queued[0].from_address == "noreply+acme@mail.hail.so"
+    assert queued[0].email_domain_id == domain.id
 
 
 @pytest.mark.asyncio

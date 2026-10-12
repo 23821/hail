@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from hailhq.core.forward_targets import (
+    MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY,
     MAX_CONFIRM_MAILS_PER_DAY,
     MAX_PENDING_TARGETS,
     RESEND_COOLDOWN,
@@ -204,13 +205,13 @@ async def test_pending_cap_blocks_a_second_list_of_strangers(async_session):
     assert await sync_targets(async_session, org_id, ["me@acme.com"]) == []
 
 
-async def _queued_confirm_mails(session, org_id, n):
+async def _queued_confirm_mails(session, org_id, n, *, to=None):
     dom = EmailDomain(
         organization_id=org_id,
         kind="hail_mail",
-        domain="a+b@mail.hail.so",
+        domain=f"a+{org_id.hex[:8]}@mail.hail.so",
         local_prefix_user="a",
-        local_prefix_org="b",
+        local_prefix_org=org_id.hex[:8],
         verification_status="verified",
         provider="ses",
     )
@@ -223,7 +224,7 @@ async def _queued_confirm_mails(session, org_id, n):
                 email_domain_id=dom.id,
                 direction="outbound",
                 from_address="noreply+b@mail.hail.so",
-                to_addresses=[f"x{i}@example.com"],
+                to_addresses=[to or f"x{i}@example.com"],
                 subject="Confirm email forwarding from Hail",
                 body_text="confirm",
                 status="sent",
@@ -241,12 +242,47 @@ async def test_daily_confirm_budget_blocks_new_targets_and_resends(async_session
     await _queued_confirm_mails(async_session, org_id, MAX_CONFIRM_MAILS_PER_DAY)
     await async_session.commit()
 
-    with pytest.raises(ConfirmBudgetExceeded):
+    with pytest.raises(ConfirmBudgetExceeded) as exc:
         await sync_targets(async_session, org_id, ["b@example.com"])
+    assert exc.value.scope == "org"
     issued.target.token_sent_at = NOW - RESEND_COOLDOWN - timedelta(seconds=1)
     await async_session.flush()
     with pytest.raises(ConfirmBudgetExceeded):
         await reissue_token(async_session, issued.target)
+
+
+@pytest.mark.asyncio
+async def test_per_address_daily_cap_counts_every_org(async_session):
+    """One account can own many orgs; the per-org caps must not add up
+    against one recipient."""
+    victim = "victim@example.com"
+    other_org = uuid.uuid4()
+    await _queued_confirm_mails(
+        async_session, other_org, MAX_CONFIRM_MAILS_PER_ADDRESS_PER_DAY, to=victim
+    )
+    await async_session.commit()
+
+    org_id = uuid.uuid4()
+    with pytest.raises(ConfirmBudgetExceeded) as exc:
+        await sync_targets(async_session, org_id, [victim])
+    assert (exc.value.scope, exc.value.address) == ("address", victim)
+    assert victim in str(exc.value)
+    # Nothing was written for the rejected save.
+    assert await list_targets(async_session, org_id) == []
+
+    # Another address in the same org is unaffected.
+    (issued,) = await sync_targets(async_session, org_id, ["fine@example.com"])
+    assert issued.target.address == "fine@example.com"
+    await async_session.commit()
+
+    # A resend to the capped address is refused too.
+    (stuck,) = await stop_targets(
+        async_session, org_id, [victim], reason="complaint", email_id=None
+    )
+    await async_session.commit()
+    with pytest.raises(ConfirmBudgetExceeded) as exc:
+        await reissue_token(async_session, stuck)
+    assert exc.value.scope == "address"
 
 
 @pytest.mark.asyncio

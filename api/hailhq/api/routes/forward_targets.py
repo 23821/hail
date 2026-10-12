@@ -28,7 +28,6 @@ from hailhq.api.ratelimit import (
 from hailhq.core.config import settings
 from hailhq.core.db import get_session
 from hailhq.core.forward_targets import (
-    MAX_CONFIRM_MAILS_PER_DAY,
     AlreadyVerified,
     ConfirmBudgetExceeded,
     ResendTooSoon,
@@ -38,7 +37,7 @@ from hailhq.core.forward_targets import (
     normalize_address,
     reissue_token,
 )
-from hailhq.core.models import EmailDomain, EmailForwardTarget
+from hailhq.core.models import EmailForwardTarget
 from hailhq.core.schemas import ForwardTargetListResponse, ForwardTargetResponse
 from hailhq.core.system_email import (
     SYSTEM_KIND_FORWARD_CONFIRM,
@@ -46,6 +45,7 @@ from hailhq.core.system_email import (
     enqueue_system_email,
     noreply_address,
     render_forward_confirm,
+    sending_identity,
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -99,18 +99,6 @@ async def list_forward_targets(
     return ForwardTargetListResponse(items=[_to_response(t) for t in targets])
 
 
-async def _sending_identity(db: AsyncSession, organization_id) -> EmailDomain | None:
-    """The row a confirm mail is sent through: the org's hail-mail address
-    when it has one, else its first custom domain."""
-    stmt = (
-        select(EmailDomain)
-        .where(EmailDomain.organization_id == organization_id)
-        .order_by((EmailDomain.kind != "hail_mail"), EmailDomain.created_at.asc())
-        .limit(1)
-    )
-    return (await db.execute(stmt)).scalar_one_or_none()
-
-
 @router.post(
     "/{address}/resend",
     response_model=ForwardTargetResponse,
@@ -122,7 +110,7 @@ async def _sending_identity(db: AsyncSession, organization_id) -> EmailDomain | 
         **merge_rate_limited_responses(
             {
                 429: {
-                    "description": "A confirm link was sent less than 10 minutes ago, or the organization reached its daily confirm-mail limit.",
+                    "description": "A confirm link was sent less than 10 minutes ago, the organization reached its daily confirm-mail limit, or the address already received its daily confirm mails.",
                     "headers": {
                         "Retry-After": {
                             "description": "Seconds to wait before retrying (cooldown case).",
@@ -158,7 +146,7 @@ async def resend_forward_confirm(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"no forward target {addr!r}",
         )
-    identity = await _sending_identity(db, principal.organization_id)
+    identity = await sending_identity(db, principal.organization_id)
     if identity is None:
         raise HTTPException(
             status_code=http_status.HTTP_409_CONFLICT,
@@ -180,11 +168,7 @@ async def resend_forward_confirm(
         ) from exc
     except ConfirmBudgetExceeded as exc:
         raise HTTPException(
-            status_code=http_status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=(
-                f"confirm-mail limit reached ({MAX_CONFIRM_MAILS_PER_DAY} per "
-                "day); try again tomorrow"
-            ),
+            status_code=http_status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)
         ) from exc
 
     sender = noreply_address(

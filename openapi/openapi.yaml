@@ -1911,9 +1911,10 @@ paths:
             sending identity.
         "429":
           description:
-            A confirm link was sent less than 10 minutes ago, or the organization
-            reached its daily confirm-mail limit. Rate limited. This caller exceeded
-            the general request-rate ceiling. Retry after the Retry-After header (seconds).
+            A confirm link was sent less than 10 minutes ago, the organization
+            reached its daily confirm-mail limit, or the address already received
+            its daily confirm mails. Rate limited. This caller exceeded the general
+            request-rate ceiling. Retry after the Retry-After header (seconds).
           headers:
             Retry-After:
               description: Seconds to wait before retrying.
