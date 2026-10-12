@@ -23,6 +23,7 @@ from hailhq.core.models import Email, EmailDomain, EmailEvent
 from hailhq.core.providers.email.inbound.ses_delivery import DeliveryEvent
 from hailhq.core.schemas import EmailEventKind
 from hailhq.core.system_email import (
+    SYSTEM_KIND_FORWARD_CONFIRM,
     SYSTEM_KIND_FORWARD_STOPPED,
     enqueue_system_email,
     noreply_address,
@@ -162,10 +163,16 @@ async def apply_delivery_event(
         )
         status_changed = result.rowcount == 1
 
-    if event.kind == "complained" and (email.metadata_ or {}).get("forwarded_from"):
-        # First delivery of this complaint only (the dedup insert above
-        # returned early on a redelivery), so a target is stopped and the
-        # owners notified exactly once per complaint.
+    meta = email.metadata_ or {}
+    if event.kind == "complained" and (
+        meta.get("forwarded_from")
+        or meta.get("system_kind") == SYSTEM_KIND_FORWARD_CONFIRM
+    ):
+        # A complaint on a forward, or on the confirm mail itself (the
+        # recipient flagged the ask), stops that target. First delivery of
+        # this complaint only (the dedup insert above returned early on a
+        # redelivery), so a target is stopped and the owners notified
+        # exactly once per complaint.
         await _stop_forwarding_on_complaint(db, email, event)
 
     if event.kind in _FANOUT_KINDS:

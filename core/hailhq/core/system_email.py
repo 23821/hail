@@ -33,8 +33,8 @@ __all__ = [
     "render_forward_stopped",
 ]
 
-# Same string as forward_targets.SYSTEM_KIND_FORWARD_CONFIRM: that module
-# counts queued confirm mails by it for the daily cap.
+# forward_targets imports this: it counts queued confirm mails by it for the
+# daily cap, and the complaint handler stops a target by it.
 SYSTEM_KIND_FORWARD_CONFIRM = "forward_confirm"
 SYSTEM_KIND_FORWARD_STOPPED = "forward_stopped"
 

@@ -26,8 +26,10 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from uuid import UUID
 
+from hailhq.core.db import org_lock
 from hailhq.core.models import Email, EmailForwardTarget, OrganizationMember, User
-from sqlalchemy import func, select, text
+from hailhq.core.system_email import SYSTEM_KIND_FORWARD_CONFIRM
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 __all__ = [
@@ -60,12 +62,12 @@ RESEND_COOLDOWN = timedelta(minutes=10)
 
 # Abuse caps, per organization. The 10-address cap on one forward_to list
 # would otherwise be defeated by saving a fresh list of strangers on every
-# PATCH: unconfirmed rows are never deleted, so count them, and count the
-# confirm mails actually queued in the last day (resends included).
+# PATCH: count the pending rows whose confirm link is still live (rows are
+# never deleted, so an expired link must not block the org forever), and
+# count the confirm mails actually queued in the last day (resends included).
 MAX_PENDING_TARGETS = 10
 MAX_CONFIRM_MAILS_PER_DAY = 20
 CONFIRM_WINDOW = timedelta(hours=24)
-SYSTEM_KIND_FORWARD_CONFIRM = "forward_confirm"
 
 
 class AlreadyVerified(Exception):
@@ -149,46 +151,40 @@ async def promote_verified_members(db: AsyncSession, organization_id: UUID) -> i
     login. A password signup is signed in before clicking the account verify
     link; its "forward to me" row waits here (no confirm mail) and starts
     the moment the account is verified. Stopped rows are never promoted: a
-    complaint stop ends only with a fresh link. Flushes; returns the count."""
-    verified = await member_emails(db, organization_id, verified=True)
-    if not verified:
-        return 0
+    complaint stop ends only with a fresh link. One UPDATE; returns the count.
+    The caller commits."""
     now = _now()
-    stmt = (
-        select(EmailForwardTarget)
+    verified_logins = (
+        select(func.lower(func.trim(User.email)))
+        .join(OrganizationMember, OrganizationMember.user_id == User.id)
+        .where(OrganizationMember.organization_id == organization_id)
+        .where(User.email_verified.is_(True))
+    )
+    result = await db.execute(
+        update(EmailForwardTarget)
         .where(EmailForwardTarget.organization_id == organization_id)
         .where(EmailForwardTarget.status == "pending")
-        .where(EmailForwardTarget.address.in_(verified))
+        .where(EmailForwardTarget.address.in_(verified_logins))
+        .values(
+            status="verified",
+            verified_at=now,
+            token_hash=None,
+            token_expires_at=None,
+            updated_at=now,
+        )
+        .execution_options(synchronize_session="fetch")
     )
-    rows = (await db.execute(stmt)).scalars().all()
-    for t in rows:
-        t.status = "verified"
-        t.verified_at = now
-        t.token_hash = None
-        t.token_expires_at = None
-        t.updated_at = now
-    if rows:
-        await db.flush()
-    return len(rows)
-
-
-async def _lock_org(db: AsyncSession, organization_id: UUID) -> None:
-    """Serialize cap checks per org for the rest of this transaction.
-
-    The caps are count-then-insert; two saves racing through the count would
-    each pass and together exceed the cap. A transaction-scoped advisory
-    lock keyed on the org makes the second one wait for the first commit.
-    """
-    key = int.from_bytes(sha256(organization_id.bytes).digest()[:8], "big", signed=True)
-    await db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+    return int(result.rowcount or 0)
 
 
 async def _pending_count(db: AsyncSession, organization_id: UUID) -> int:
+    """Pending rows whose confirm link can still be clicked."""
     stmt = (
         select(func.count())
         .select_from(EmailForwardTarget)
         .where(EmailForwardTarget.organization_id == organization_id)
         .where(EmailForwardTarget.status == "pending")
+        .where(EmailForwardTarget.token_expires_at > _now())
     )
     return int((await db.execute(stmt)).scalar_one())
 
@@ -260,11 +256,13 @@ async def sync_targets(
     token — only brand-new non-member addresses. An existing row (pending,
     verified or stopped) is never touched, so re-saving the same list sends
     no mail. Flushes, does not commit."""
-    # Lock first: the console saves one list to every domain row of the org
-    # in parallel, so two requests with the same new address arrive together.
-    # The second one waits here, then reads the first one's committed row and
-    # has nothing new to do — no duplicate row, no second confirm mail.
-    await _lock_org(db, organization_id)
+    # Lock first (hailhq.core.db.org_lock, transaction-scoped): the console
+    # saves one list to every domain row of the org in parallel, so two
+    # requests with the same new address arrive together. The second one
+    # waits here, then reads the first one's committed row and has nothing
+    # new to do — no duplicate row, no second confirm mail. The same lock
+    # serializes the count-then-insert cap checks below.
+    await org_lock(db, organization_id)
     existing = await _rows_for(db, organization_id, addresses)
     wanted: list[str] = []
     for a in addresses:
@@ -278,9 +276,7 @@ async def sync_targets(
     # A member whose login email is not yet verified gets a pending row with
     # no confirm mail: the account verify click promotes it (see
     # promote_verified_members). One email for the signup, not two.
-    unverified_members = (
-        await member_emails(db, organization_id, verified=False)
-    ) - members
+    unverified_members = await member_emails(db, organization_id, verified=False)
     strangers = [a for a in new if a not in members and a not in unverified_members]
     if strangers:
         # Caps apply before any row is written so a rejected save leaves
@@ -320,6 +316,10 @@ async def reissue_token(db: AsyncSession, target: EmailForwardTarget) -> str:
     """New confirm token for a pending or stopped row. Raises
     :class:`AlreadyVerified` / :class:`ResendTooSoon` /
     :class:`ConfirmBudgetExceeded`."""
+    # Lock before reading the row's timestamps: two resends arriving together
+    # must not both pass the cooldown on the same stale token_sent_at.
+    await org_lock(db, target.organization_id)
+    await db.refresh(target)
     if target.status == "verified":
         raise AlreadyVerified(target.address)
     now = _now()
@@ -327,7 +327,6 @@ async def reissue_token(db: AsyncSession, target: EmailForwardTarget) -> str:
         elapsed = now - target.token_sent_at
         if elapsed < RESEND_COOLDOWN:
             raise ResendTooSoon(RESEND_COOLDOWN - elapsed)
-    await _lock_org(db, target.organization_id)
     await check_confirm_budget(db, target.organization_id, wanted=1)
     raw = _issue(target, now)
     await db.flush()

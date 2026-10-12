@@ -139,6 +139,8 @@ async def test_reissue_respects_cooldown_and_verified(async_session):
     assert timedelta(0) < exc.value.retry_after <= RESEND_COOLDOWN
 
     target.token_sent_at = NOW - RESEND_COOLDOWN - timedelta(seconds=1)
+    # reissue_token re-reads the row under the org lock: persist the edit.
+    await async_session.flush()
     raw = await reissue_token(async_session, target)
     await async_session.commit()
     assert raw != issued.raw_token
@@ -242,6 +244,7 @@ async def test_daily_confirm_budget_blocks_new_targets_and_resends(async_session
     with pytest.raises(ConfirmBudgetExceeded):
         await sync_targets(async_session, org_id, ["b@example.com"])
     issued.target.token_sent_at = NOW - RESEND_COOLDOWN - timedelta(seconds=1)
+    await async_session.flush()
     with pytest.raises(ConfirmBudgetExceeded):
         await reissue_token(async_session, issued.target)
 

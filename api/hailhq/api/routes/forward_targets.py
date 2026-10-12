@@ -22,6 +22,7 @@ from hailhq.api.audit import actor_of, write_audit_log
 from hailhq.api.deps import Principal, get_current_principal
 from hailhq.api.ratelimit import (
     GENERAL_RATE_LIMITED_RESPONSES,
+    exempt_path,
     merge_rate_limited_responses,
 )
 from hailhq.core.config import settings
@@ -52,6 +53,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/forward-targets", tags=["forward-targets"])
+
+# The confirm page is public (the 256-bit token is the credential, same as
+# /unsubscribe). Without this it falls into the shared remote-IP bucket, and
+# in production every anonymous caller resolves to the proxy's IP — a
+# recipient's confirm click would 429 whenever any anonymous traffic flows.
+exempt_path("/forward-targets/confirm")
 
 
 def _to_response(t: EmailForwardTarget) -> ForwardTargetResponse:
@@ -86,6 +93,9 @@ async def list_forward_targets(
     ``forward_to``. Only ``verified`` addresses receive forwards.
     """
     targets = await list_targets(db, principal.organization_id)
+    # list_targets promotes a member's pending row once their account email
+    # is verified; the session does not auto-commit, so persist that here.
+    await db.commit()
     return ForwardTargetListResponse(items=[_to_response(t) for t in targets])
 
 

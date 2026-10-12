@@ -813,7 +813,8 @@ async def patch_email_domain(
         except PendingLimitExceeded as exc:
             raise unprocessable(
                 f"too many unconfirmed forward addresses (max "
-                f"{MAX_PENDING_TARGETS}); wait for confirmations or remove some",
+                f"{MAX_PENDING_TARGETS}); wait for confirmations or for their "
+                "links to expire",
                 loc=["body", "forward_to"],
             ) from exc
         except ConfirmBudgetExceeded as exc:

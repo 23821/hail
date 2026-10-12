@@ -395,3 +395,44 @@ async def test_complaint_on_direct_send_leaves_forward_targets_alone(async_sessi
         )
     ).scalar_one()
     assert target.status == "verified"
+
+
+async def test_complaint_on_confirm_mail_stops_pending_target(async_session):
+    """The recipient flagged the confirm ask itself: no more links go out
+    until the console sends a fresh one on purpose."""
+    email = await _mk_email(async_session, status="delivered")
+    email.to_addresses = ["stranger@example.com"]
+    email.metadata_ = {
+        "system_kind": "forward_confirm",
+        "forward_headers": {"Auto-Submitted": "auto-generated"},
+    }
+    async_session.add(
+        EmailForwardTarget(
+            organization_id=email.organization_id,
+            address="stranger@example.com",
+            status="pending",
+            token_hash="x" * 64,
+        )
+    )
+    await async_session.commit()
+    fanout = AsyncMock(return_value=0)
+    await apply_delivery_event(
+        async_session,
+        _ev(
+            email.provider_message_id,
+            "complained",
+            detail={"recipients": ["stranger@example.com"]},
+        ),
+        fanout=fanout,
+    )
+    await async_session.commit()
+    target = (
+        await async_session.execute(
+            select(EmailForwardTarget).where(
+                EmailForwardTarget.organization_id == email.organization_id
+            )
+        )
+    ).scalar_one()
+    assert target.status == "stopped"
+    assert target.stopped_reason == "complaint"
+    assert target.token_hash is None
